@@ -1,0 +1,17 @@
+[project]
+name = "flow-inverse"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "cmocean>=4.0.3",
+    "einops>=0.8.1",
+    "matplotlib>=3.9.4",
+    "pot>=0.9.6.post1",
+    "pypardiso>=0.4.7",
+    "torch>=2.8.0",
+    "torchdiffeq>=0.2.5",
+    "torchvision>=0.23.0",
+    "tqdm>=4.67.1",
+]
