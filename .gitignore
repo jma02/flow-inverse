@@ -15,5 +15,8 @@ data/*.pt
 saved_runs/
 
 # everything in data except utiils
-!data/utils/
+!data/
 !data/utils/**
+
+# large torchvision datasets
+data/torchvision/
