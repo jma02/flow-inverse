@@ -82,8 +82,8 @@ def create_circles_dataset(num_samples=5000, im_size=128, problem='ct'):
     return dataset
 
 parser = argparse.ArgumentParser(description="Generate circles.")
-parser.add_argument('--im_size', type=int, default=128)
-parser.add_argument('--problem', type=str, default='ct', help='ct or eit')
+parser.add_argument('--im_size', type=int, default=256)
+parser.add_argument('--problem', type=str, default='eit', help='ct or eit')
 
 args = parser.parse_args()
 problem = args.problem

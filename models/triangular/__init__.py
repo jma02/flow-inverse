@@ -1,2 +1,3 @@
 from .default import UnetTriangular as UnetTriangular
+from .triangular_x_pred_fine_tune import TriangularFineTune as TriangularFineTune
 from .triangular_y_pred import UnetTriangularYPred as UnetTriangularYPred

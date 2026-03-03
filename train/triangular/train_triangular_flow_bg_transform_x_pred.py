@@ -55,9 +55,6 @@ def get_loss_fn(model: UnetTriangular):
     return loss_fn
 
 def get_background(mesh_file, device='cuda'):
-    img_size = 128
-    original_size = 128
-    pad_size = 0
 
     mat_contents = sio.loadmat(mesh_file)
 

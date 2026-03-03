@@ -12,10 +12,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate data pairs of conductivities and dtn maps.")
     parser.add_argument('--problem', type=str, default='circles', help='Dataset to use')
     parser.add_argument('--mesh', type=str, default='default', help='Mesh to use')
+    parser.add_argument('--im_size', type=int, default=256, help='Image size')
 
     args = parser.parse_args()
 
-    img_size = 128
+    img_size = args.im_size
     dataset_source = torch.load(f"data/eit-{args.problem}-dataset-{img_size}.pt")
 
     dataset = {}
@@ -68,7 +69,7 @@ if __name__ == '__main__':
         }
 
     # refined if we are using the completed mesh in the mesh-data folder.
-    save_name = f"data/eit-{args.problem}-dtn-{args.mesh}-128.pt"
+    save_name = f"data/eit-{args.problem}-dtn-{args.mesh}-{args.im_size}.pt"
     torch.save(dataset, save_name)
     print(f"Saved dataset to {save_name}")
 

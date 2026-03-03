@@ -32,8 +32,14 @@ torch.backends.cuda.enable_math_sdp(True)
 P_STD = 0.8
 P_MEAN = -0.8
 SIGMA_MIN = 1e-2
-EPS = 5e-2
 WARMUP_EPOCHS = 6
+DTN_STEPS = 10
+DTN_WEIGHT = 1.0
+EPS = 5e-2
+TRAIN_X_MIN = None
+TRAIN_X_MAX = None
+TRAIN_Y_MIN = None
+TRAIN_Y_MAX = None
 
 @torch.compile
 def step(t: Tensor, x0: Tensor, x1: Tensor) -> Tensor:
@@ -52,7 +58,61 @@ def sample_t(n: int, device=None):
     z = torch.randn(n, device=device) * P_STD + P_MEAN
     return torch.sigmoid(z)
 
-def get_loss_fn(model: JiT_XS_8):
+def v_from_x_pred(model: JiT_XS_8, z: Tensor, t: Tensor, x_cond: Tensor) -> Tensor:
+    t_batch = t.expand(z.shape[0])
+    t_broadcast = t_batch[:, None, None, None]
+    with torch.autocast(device_type=t.device.type, dtype=torch.bfloat16):
+        x_pred = model(z, t_batch, x_cond)
+    denom = torch.clamp(1 - (1 - SIGMA_MIN) * t_broadcast, min=EPS)
+    v_pred = x_pred - (1 - SIGMA_MIN) * (z - t_broadcast * x_pred) / denom
+    return v_pred
+
+def sample_sigma_from_noise(
+    model: JiT_XS_8,
+    x_cond: Tensor,
+) -> Tensor:
+    x0 = torch.randn_like(x_cond)
+    timesteps = torch.linspace(0.0, 1.0, steps=DTN_STEPS, device=x_cond.device)
+    pred = odeint(
+        func=lambda t, x: v_from_x_pred(model, x, t, x_cond),
+        t=timesteps,
+        y0=x0,
+        method="euler",
+        atol=1e-5,
+        rtol=1e-5,
+    )[-1]
+    return pred
+
+def dtn_loss_from_sigma(
+    sigma_pred: Tensor,
+    x_cond: Tensor,
+    mesh: Mesh,
+    v_h: V_h,
+    background: Tensor,
+) -> Tensor:
+    with torch.autocast(device_type=sigma_pred.device.type, enabled=False):
+        sigma_phys = (0.5 * (sigma_pred + 1.0) * (TRAIN_Y_MAX - TRAIN_Y_MIN) + TRAIN_Y_MIN).float()
+        dtn_preds = []
+        for i in range(sigma_phys.shape[0]):
+            dtn = dtn_from_sigma(
+                sigma_vec=sigma_phys[i, 0],
+                v_h=v_h,
+                mesh=mesh,
+                img_size=128,
+                device=sigma_phys.device,
+            )
+            dtn = dtn / background
+            dtn = 2.0 * (dtn - TRAIN_X_MIN) / (TRAIN_X_MAX - TRAIN_X_MIN + 1e-12) - 1.0
+            dtn_preds.append(dtn)
+        dtn_pred = torch.stack(dtn_preds).unsqueeze(1)
+    return MSELoss()(dtn_pred.to(x_cond.dtype), x_cond)
+
+def get_loss_fn(
+    model: JiT_XS_8,
+    mesh: Mesh,
+    v_h: V_h,
+    background: Tensor,
+):
     def loss_fn(x_cond: Tensor, y: Tensor) -> Tensor:
         # in their JiT code they sample t sigmoidally
         t = sample_t(y.size(0), device=y.device)
@@ -66,9 +126,18 @@ def get_loss_fn(model: JiT_XS_8):
             x_cond = x_cond.unsqueeze(1)
 
         x_pred = model(z_t, t, x_cond)
-        denom = torch.clamp(1 - (1 - SIGMA_MIN) * t_broadcast, min=EPS)
-        v_pred = x_pred - (1 - SIGMA_MIN) * (z_t - t_broadcast * x_pred) / denom
+        sigma = torch.clamp(1 - (1 - SIGMA_MIN) * t_broadcast, min=EPS)
+        v_pred = x_pred - (1 - SIGMA_MIN) * (z_t - t_broadcast * x_pred) / sigma
         loss = MSELoss()(v, v_pred)
+        sigma_pred = sample_sigma_from_noise(model, x_cond)
+        dtn_loss = dtn_loss_from_sigma(
+            sigma_pred=sigma_pred,
+            x_cond=x_cond,
+            mesh=mesh,
+            v_h=v_h,
+            background=background,
+        )
+        loss = loss + DTN_WEIGHT * dtn_loss
         return loss
     return loss_fn 
     
@@ -91,26 +160,26 @@ def get_background(mesh_file, device='cuda'):
     vol_idx = torch.tensor(mat_contents['vol_idx'].reshape((-1,))-1, dtype=torch.long).to(device)
     bdy_idx = torch.tensor(mat_contents['bdy_idx'].reshape((-1,))-1, dtype=torch.long).to(device)
 
-    mesh = Mesh(p, t, bdy_idx, vol_idx)
+    mesh = Mesh(p, t, bdy_idx, vol_idx, device=device)
     v_h = V_h(mesh)
 
     # get the dtn map
-    dtn_background = dtn_from_sigma(sigma_vec=torch.ones(128, 128), v_h=v_h, mesh=mesh, img_size=128, device=device)
+    dtn_background = dtn_from_sigma(sigma_vec=torch.ones(128, 128, device=device), v_h=v_h, mesh=mesh, img_size=128, device=device)
     
-    return dtn_background 
+    return mesh, v_h, dtn_background 
 
 if __name__ == '__main__':
     # command line arguments
     parser = argparse.ArgumentParser(description="Train a flow matching model.")
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use for training')
     parser.add_argument('--ckpt', type=str, default=None, help='Path to a checkpoint to resume training from')
-    parser.add_argument('--save_dir', type=str, default='circles-eit-cond-dtn-strong-JiT-ema-nocfg_linear_warmup_x_pred', help='Directory to save models')
+    parser.add_argument('--save_dir', type=str, default='circles-eit-cond-dtn-strong-JiT-ema-nocfg_linear_warmup_x_pred_pinn', help='Directory to save models')
     parser.add_argument('--data_file', type=str, default='eit-circles-dtn-default-128.pt', help='Path to the dataset file')
 
     args = parser.parse_args()
     blr = 5e-5  # Base learning rate  
     epochs = 600
-    batch_size = 128
+    batch_size = 64
     actual_lr = blr * batch_size / 256  
     log_freq = 1000
     num_workers = 16
@@ -120,15 +189,15 @@ if __name__ == '__main__':
     dataset = torch.load(f"data/{args.data_file}", map_location="cpu")
 
     mesh_file = "mesh-data/mesh_128_h05.mat"
-    background = get_background(mesh_file, device=args.device)
-
+    mesh, v_h, background = get_background(mesh_file, device=args.device)
+    background = background.to('cpu')
 
     dataset_X_train = dataset["train"]["dtn_map"].float()
     dataset_Y_train = dataset["train"]["media"].float()
 
     dataset_X_train = dataset_X_train / background
 
-    train_X_min = dataset_X_train.min()
+    train_X_min = dataset_X_train.min() 
     train_X_max = dataset_X_train.max()
     train_Y_min = dataset_Y_train.min()
     train_Y_max = dataset_Y_train.max()
@@ -154,11 +223,22 @@ if __name__ == '__main__':
     if dataset_Y_val.ndim == 3:
         dataset_Y_val = dataset_Y_val.unsqueeze(1)
 
+    TRAIN_X_MIN = train_X_min.to(device)
+    TRAIN_X_MAX = train_X_max.to(device)
+    TRAIN_Y_MIN = train_Y_min.to(device)
+    TRAIN_Y_MAX = train_Y_max.to(device)
+    background = background.to(device)
+
     model = JiT_XS_8(in_channels=1, cond_in_channels=1, out_channels=1, input_size=128).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("Number of trainable parameters: {:.6f}M".format(n_params / 1e6))
 
-    loss_fn = get_loss_fn(model)
+    loss_fn = get_loss_fn(
+        model=model,
+        mesh=mesh,
+        v_h=v_h,
+        background=background,
+    )
     
     optim = torch.optim.AdamW(model.parameters(), lr=actual_lr, betas=(0.9, 0.95), weight_decay=1e-3)
     # after loading the data we change working directory
@@ -234,7 +314,7 @@ if __name__ == '__main__':
 
             optim.zero_grad(set_to_none=True)
             
-            with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
+            with torch.autocast(device_type=x_cond.device.type, dtype=torch.bfloat16):
                 loss = loss_fn(x_cond, y)
 
             if not torch.isfinite(loss):
@@ -262,13 +342,7 @@ if __name__ == '__main__':
             x_cond = dataset_X_train[0:1].to(device).repeat(4, 1, 1, 1)
             x0 = torch.randn(4, 1, 128, 128).to(device)
             def v_field(z, t):
-                t_batch = t.expand(z.shape[0])
-                t_broadcast = t_batch[:, None, None, None]
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    x_pred = eval_model(z, t_batch, x_cond)
-                denom = torch.clamp(1 - (1 - SIGMA_MIN) * t_broadcast, min=EPS)
-                v_pred = x_pred - (1 - SIGMA_MIN) * (z - t_broadcast * x_pred) / denom
-                return v_pred
+                return v_from_x_pred(eval_model, z, t, x_cond)
             
             timesteps = torch.linspace(0.0, 1.0, steps=20).to(device)
             pred = odeint(
@@ -321,11 +395,20 @@ if __name__ == '__main__':
                 z_t = step(t, x0, y_f)
                 v = target(t, x0, y_f)
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type=x_cond.device.type, dtype=torch.bfloat16):
                     x_pred = eval_model(z_t, t, x_cond)
-                denom = torch.clamp(1 - (1 - SIGMA_MIN) * t_broadcast, min=EPS)
-                v_pred = x_pred - (1 - SIGMA_MIN) * (z_t - t_broadcast * x_pred) / denom
-                batch_loss = MSELoss()(v, v_pred)
+                sigma = torch.clamp(1 - (1 - SIGMA_MIN) * t_broadcast, min=EPS)
+                v_pred = x_pred - (1 - SIGMA_MIN) * (z_t - t_broadcast * x_pred) / sigma
+                base_loss = MSELoss()(v, v_pred)
+                sigma_pred = sample_sigma_from_noise(eval_model, x_cond)
+                dtn_loss = dtn_loss_from_sigma(
+                    sigma_pred=sigma_pred,
+                    x_cond=x_cond,
+                    mesh=mesh,
+                    v_h=v_h,
+                    background=background,
+                )
+                batch_loss = base_loss + DTN_WEIGHT * dtn_loss
 
                 val_loss_total += batch_loss.item()
                 val_batches += 1
